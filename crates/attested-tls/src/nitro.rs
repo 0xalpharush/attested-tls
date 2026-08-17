@@ -330,8 +330,10 @@ fn verify_certificate_chain(
 ) -> Result<Vec<u8>, NitroError> {
     let leaf = parse_certificate(document.certificate.as_ref())?;
     verify_validity(&leaf, now)?;
+    // Nitro serializes its CA bundle root-first: [ROOT, INTERM_1, …,
+    // INTERM_N]. Build the verification path in the opposite direction.
     let (root_bytes, intermediate_bytes) =
-        document.cabundle.split_last().ok_or(NitroError::MissingCaBundle)?;
+        document.cabundle.split_first().ok_or(NitroError::MissingCaBundle)?;
     if Sha256::digest(root_bytes.as_ref()).as_ref() != AWS_NITRO_ROOT_G1_SHA256 {
         return Err(NitroError::UntrustedRoot);
     }
