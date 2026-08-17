@@ -1,4 +1,5 @@
 //! An attested TLS certificate resolver and verifier
+pub mod nitro;
 use std::{
     collections::HashMap,
     fmt,

@@ -18,6 +18,9 @@ tracing = "0.1.41"
 webpki-roots = "1.0.7"
 x509-parser = { version = "0.16", features = ["verify"] } # version must match the one from ra-tls
 yasna = "0.5.2"
+aws-nitro-enclaves-nsm-api = { version = "0.4.0", features = ["nix"] }
+coset = "0.3.8"
+ring = "0.17.14"
 
 [dev-dependencies]
 attestation = { workspace = true, features = ["mock"] }
