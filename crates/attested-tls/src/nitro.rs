@@ -32,7 +32,7 @@ use x509_parser::{certificate::X509Certificate, parse_x509_certificate};
 
 /// Private X.509 extension carrying the raw, COSE_Sign1-encoded Nitro document.
 ///
-/// This is a Tempo-owned private enterprise arc. The extension is non-critical:
+/// This is a deployment-owned private enterprise arc. The extension is non-critical:
 /// clients that do not implement attested TLS reject the self-signed leaf in the
 /// usual way, while attested clients require this extension.
 pub const NITRO_ATTESTATION_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 57264, 1, 1];
@@ -135,6 +135,7 @@ pub struct NitroServerVerifier {
     context: Vec<u8>,
     nonce: Vec<u8>,
     provider: Arc<CryptoProvider>,
+    trust_anchor_fingerprint: [u8; 32],
 }
 
 impl NitroServerVerifier {
@@ -148,7 +149,13 @@ impl NitroServerVerifier {
         if nonce.len() < 32 {
             return Err(NitroError::NonceTooShort);
         }
-        Ok(Self { policy, context, nonce, provider })
+        Ok(Self {
+            policy,
+            context,
+            nonce,
+            provider,
+            trust_anchor_fingerprint: AWS_NITRO_ROOT_G1_SHA256,
+        })
     }
 
     fn certificate_extension<'a>(
@@ -189,7 +196,7 @@ impl ServerCertVerifier for NitroServerVerifier {
         verify_cert_unix_time(&certificate, now)?;
         verify_server_name(&ParsedCertificate::try_from(end_entity)?, server_name)?;
         let evidence = Self::certificate_extension(&certificate)?;
-        verify_document(
+        verify_document_with_trust_anchor(
             evidence,
             &self.policy,
             NitroBinding {
@@ -198,6 +205,7 @@ impl ServerCertVerifier for NitroServerVerifier {
                 tls_spki: certificate.public_key().raw,
             },
             SystemTime::UNIX_EPOCH + Duration::from_secs(now.as_secs()),
+            self.trust_anchor_fingerprint,
         )
         .map_err(|error| {
             rustls::Error::General(format!("Nitro attestation verification failed: {error}"))
@@ -258,6 +266,16 @@ pub fn verify_document(
     binding: NitroBinding<'_>,
     now: SystemTime,
 ) -> Result<AttestationDoc, NitroError> {
+    verify_document_with_trust_anchor(encoded, policy, binding, now, AWS_NITRO_ROOT_G1_SHA256)
+}
+
+fn verify_document_with_trust_anchor(
+    encoded: &[u8],
+    policy: &NitroPolicy,
+    binding: NitroBinding<'_>,
+    now: SystemTime,
+    trust_anchor_fingerprint: [u8; 32],
+) -> Result<AttestationDoc, NitroError> {
     policy.validate()?;
     if encoded.len() > 16 * 1024 {
         return Err(NitroError::DocumentTooLarge);
@@ -269,7 +287,7 @@ pub fn verify_document(
     let payload = cose.payload.as_deref().ok_or(NitroError::MissingPayload)?;
     let document =
         AttestationDoc::from_binary(payload).map_err(|_| NitroError::MalformedDocument)?;
-    let signing_key = verify_certificate_chain(&document, now)?;
+    let signing_key = verify_certificate_chain(&document, now, trust_anchor_fingerprint)?;
     cose.verify_signature(&[], |signature, signed| {
         UnparsedPublicKey::new(&ECDSA_P384_SHA384_FIXED, signing_key)
             .verify(signed, signature)
@@ -327,6 +345,7 @@ fn verify_pcrs(document: &AttestationDoc, policy: &NitroPolicy) -> Result<(), Ni
 fn verify_certificate_chain(
     document: &AttestationDoc,
     now: SystemTime,
+    trust_anchor_fingerprint: [u8; 32],
 ) -> Result<Vec<u8>, NitroError> {
     let leaf = parse_certificate(document.certificate.as_ref())?;
     verify_validity(&leaf, now)?;
@@ -334,7 +353,7 @@ fn verify_certificate_chain(
     // INTERM_N]. Build the verification path in the opposite direction.
     let (root_bytes, intermediate_bytes) =
         document.cabundle.split_first().ok_or(NitroError::MissingCaBundle)?;
-    if Sha256::digest(root_bytes.as_ref()).as_ref() != AWS_NITRO_ROOT_G1_SHA256 {
+    if Sha256::digest(root_bytes.as_ref()).as_ref() != trust_anchor_fingerprint {
         return Err(NitroError::UntrustedRoot);
     }
     let mut issuer = parse_certificate(root_bytes.as_ref())?;
@@ -354,7 +373,7 @@ fn verify_certificate_chain(
     if leaf.verify_signature(Some(issuer.public_key())).is_err() {
         return Err(NitroError::InvalidCertificateChain);
     }
-    Ok(leaf.public_key().raw.to_vec())
+    Ok(leaf.public_key().subject_public_key.data.to_vec())
 }
 
 fn parse_certificate(input: &[u8]) -> Result<X509Certificate<'_>, NitroError> {
@@ -433,4 +452,205 @@ pub enum NitroError {
     CertificateGeneration,
     #[error("Nitro attestation generation failed: {0}")]
     AttestationGeneration(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, time::Duration};
+
+    use aws_nitro_enclaves_nsm_api::api::Digest as NitroDigest;
+    use coset::{CoseSign1, CoseSign1Builder, TaggedCborSerializable as _};
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair,
+        PKCS_ECDSA_P256_SHA256, PKCS_ECDSA_P384_SHA384,
+    };
+    use ring::{
+        rand::SystemRandom,
+        signature::{
+            ECDSA_P384_SHA384_FIXED, ECDSA_P384_SHA384_FIXED_SIGNING, EcdsaKeyPair,
+            KeyPair as RingKeyPair, UnparsedPublicKey,
+        },
+    };
+    use rustls::{client::danger::ServerCertVerifier as _, pki_types::ServerName};
+
+    use super::*;
+
+    struct Fixture {
+        certificate: CertificateDer<'static>,
+        context: Vec<u8>,
+        nonce: Vec<u8>,
+        policy: NitroPolicy,
+        root_fingerprint: [u8; 32],
+        now: SystemTime,
+    }
+
+    fn now_millis(now: SystemTime) -> u64 {
+        now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() * 1_000
+    }
+
+    fn fixture(document_timestamp: SystemTime, document_spki: Option<Vec<u8>>) -> Fixture {
+        let rng = SystemRandom::new();
+        let root_pkcs8 =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, &rng).unwrap();
+        let root_key = KeyPair::from_pkcs8_der_and_sign_algo(
+            &PrivatePkcs8KeyDer::from(root_pkcs8.as_ref()),
+            &PKCS_ECDSA_P384_SHA384,
+        )
+        .unwrap();
+        let mut root_params = CertificateParams::default();
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let root = CertifiedIssuer::self_signed(root_params, root_key).unwrap();
+
+        let signer_pkcs8 =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, &rng).unwrap();
+        let signer =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, signer_pkcs8.as_ref(), &rng)
+                .unwrap();
+        let signer_key = KeyPair::from_pkcs8_der_and_sign_algo(
+            &PrivatePkcs8KeyDer::from(signer_pkcs8.as_ref()),
+            &PKCS_ECDSA_P384_SHA384,
+        )
+        .unwrap();
+        let signer_params = CertificateParams::new(vec!["nitro-attester.invalid".into()]).unwrap();
+        let signer_certificate = signer_params.signed_by(&signer_key, &root).unwrap();
+        let parsed_signer = parse_certificate(signer_certificate.der().as_ref()).unwrap();
+        assert_eq!(
+            parsed_signer.public_key().subject_public_key.data,
+            signer.public_key().as_ref()
+        );
+
+        let tls_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let tls_spki = tls_key.subject_public_key_info();
+        let context = b"tempo-zone-prover/ratls/1".to_vec();
+        let nonce = vec![7_u8; 32];
+        let pcrs = BTreeMap::from([(0, vec![0x11; 48]), (1, vec![0x22; 48])]);
+        let bound_spki = document_spki.unwrap_or_else(|| tls_spki.clone());
+        let document = AttestationDoc::new(
+            "test-nitro-module".into(),
+            NitroDigest::SHA256,
+            now_millis(document_timestamp),
+            pcrs.clone(),
+            signer_certificate.der().to_vec(),
+            vec![root.der().to_vec()],
+            Some(
+                binding_user_data(NitroBinding {
+                    context: &context,
+                    nonce: &nonce,
+                    tls_spki: &bound_spki,
+                })
+                .to_vec(),
+            ),
+            Some(nonce.clone()),
+            Some(bound_spki),
+        );
+        let evidence = CoseSign1Builder::new()
+            .payload(document.to_binary())
+            .create_signature(&[], |input| signer.sign(&rng, input).unwrap().as_ref().to_vec())
+            .build()
+            .to_tagged_vec()
+            .unwrap();
+        let cose = CoseSign1::from_tagged_slice(&evidence).unwrap();
+        cose.verify_signature(&[], |signature, data| {
+            UnparsedPublicKey::new(&ECDSA_P384_SHA384_FIXED, signer.public_key())
+                .verify(data, signature)
+                .map_err(|_| ())
+        })
+        .unwrap();
+
+        let mut tls_params =
+            CertificateParams::new(vec!["tempo-zone-prover.invalid".into()]).unwrap();
+        tls_params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(NITRO_ATTESTATION_OID, evidence));
+        let certificate =
+            CertificateDer::from(tls_params.self_signed(&tls_key).unwrap().der().to_vec());
+        Fixture {
+            certificate,
+            context,
+            nonce,
+            policy: NitroPolicy {
+                pcrs: pcrs.into_iter().map(|(index, value)| (index, vec![value])).collect(),
+                max_age: Duration::from_secs(60),
+                module_id: Some("test-nitro-module".into()),
+            },
+            root_fingerprint: Sha256::digest(root.der().as_ref()).into(),
+            now: document_timestamp,
+        }
+    }
+
+    fn verifier(fixture: &Fixture) -> NitroServerVerifier {
+        NitroServerVerifier {
+            policy: fixture.policy.clone(),
+            context: fixture.context.clone(),
+            nonce: fixture.nonce.clone(),
+            provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+            trust_anchor_fingerprint: fixture.root_fingerprint,
+        }
+    }
+
+    fn verify(
+        fixture: &Fixture,
+        verifier: NitroServerVerifier,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        verifier.verify_server_cert(
+            &fixture.certificate,
+            &[],
+            &ServerName::try_from("tempo-zone-prover.invalid").unwrap(),
+            &[],
+            UnixTime::since_unix_epoch(fixture.now.duration_since(SystemTime::UNIX_EPOCH).unwrap()),
+        )
+    }
+
+    #[test]
+    fn authenticates_a_certificate_bound_nitro_document() {
+        let fixture = fixture(SystemTime::now(), None);
+        let result = verify(&fixture, verifier(&fixture));
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn rejects_invalid_pcr_after_authenticating_the_document() {
+        let fixture = fixture(SystemTime::now(), None);
+        let mut verifier = verifier(&fixture);
+        verifier.policy.pcrs.get_mut(&0).unwrap()[0][0] ^= 0xff;
+        assert!(
+            verify(&fixture, verifier).unwrap_err().to_string().contains("PCR 0 is not approved")
+        );
+    }
+
+    #[test]
+    fn rejects_a_replayed_document_for_a_new_nonce() {
+        let fixture = fixture(SystemTime::now(), None);
+        let mut verifier = verifier(&fixture);
+        verifier.nonce[0] ^= 0xff;
+        assert!(
+            verify(&fixture, verifier).unwrap_err().to_string().contains("nonce does not match")
+        );
+    }
+
+    #[test]
+    fn rejects_a_document_bound_to_a_different_tls_spki() {
+        let fixture = fixture(SystemTime::now(), Some(vec![0x42; 91]));
+        assert!(
+            verify(&fixture, verifier(&fixture))
+                .unwrap_err()
+                .to_string()
+                .contains("public key does not match")
+        );
+    }
+
+    #[test]
+    fn rejects_stale_attestation_evidence() {
+        let now = SystemTime::now();
+        let fixture = fixture(now.checked_sub(Duration::from_secs(61)).unwrap(), None);
+        let verifier = verifier(&fixture);
+        let error = verifier.verify_server_cert(
+            &fixture.certificate,
+            &[],
+            &ServerName::try_from("tempo-zone-prover.invalid").unwrap(),
+            &[],
+            UnixTime::since_unix_epoch(now.duration_since(SystemTime::UNIX_EPOCH).unwrap()),
+        );
+        assert!(error.unwrap_err().to_string().contains("is stale"));
+    }
 }
