@@ -4,6 +4,8 @@
 //! the enclave supplies a signed document and the peer validates it here.  This
 //! keeps the verifier usable by ordinary hosts and makes the policy explicit.
 
+#![deny(clippy::cast_lossless)]
+
 use std::{
     collections::BTreeMap,
     sync::Arc,
@@ -456,7 +458,7 @@ pub enum NitroError {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, time::Duration};
+    use std::{collections::BTreeMap, sync::Mutex, time::Duration};
 
     use aws_nitro_enclaves_nsm_api::api::Digest as NitroDigest;
     use coset::{CoseSign1, CoseSign1Builder, TaggedCborSerializable as _};
@@ -472,6 +474,8 @@ mod tests {
         },
     };
     use rustls::{client::danger::ServerCertVerifier as _, pki_types::ServerName};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
 
     use super::*;
 
@@ -482,6 +486,95 @@ mod tests {
         policy: NitroPolicy,
         root_fingerprint: [u8; 32],
         now: SystemTime,
+    }
+
+    struct TestAttester {
+        signer: Mutex<EcdsaKeyPair>,
+        certificate: Vec<u8>,
+        cabundle: Vec<Vec<u8>>,
+        pcrs: BTreeMap<usize, Vec<u8>>,
+    }
+
+    impl NitroAttester for TestAttester {
+        fn attest(
+            &self,
+            nonce: &[u8],
+            tls_spki: &[u8],
+            user_data: &[u8],
+        ) -> Result<Vec<u8>, NitroError> {
+            let document = AttestationDoc::new(
+                "test-nitro-module".into(),
+                NitroDigest::SHA256,
+                now_millis(SystemTime::now()),
+                self.pcrs.clone(),
+                self.certificate.clone(),
+                self.cabundle.clone(),
+                Some(user_data.to_vec()),
+                Some(nonce.to_vec()),
+                Some(tls_spki.to_vec()),
+            );
+            let rng = SystemRandom::new();
+            let signer = self.signer.lock().map_err(|_| {
+                NitroError::AttestationGeneration("test signer lock poisoned".into())
+            })?;
+            CoseSign1Builder::new()
+                .payload(document.to_binary())
+                .create_signature(&[], |input| {
+                    signer.sign(&rng, input).unwrap().as_ref().to_vec()
+                })
+                .build()
+                .to_tagged_vec()
+                .map_err(|error| NitroError::AttestationGeneration(error.to_string()))
+        }
+    }
+
+    fn test_attester() -> (TestAttester, NitroPolicy, [u8; 32]) {
+        let rng = SystemRandom::new();
+        let root_pkcs8 =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, &rng).unwrap();
+        let root_key = KeyPair::from_pkcs8_der_and_sign_algo(
+            &PrivatePkcs8KeyDer::from(root_pkcs8.as_ref()),
+            &PKCS_ECDSA_P384_SHA384,
+        )
+        .unwrap();
+        let mut root_params = CertificateParams::default();
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let root = CertifiedIssuer::self_signed(root_params, root_key).unwrap();
+
+        let signer_pkcs8 =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, &rng).unwrap();
+        let signer = EcdsaKeyPair::from_pkcs8(
+            &ECDSA_P384_SHA384_FIXED_SIGNING,
+            signer_pkcs8.as_ref(),
+            &rng,
+        )
+        .unwrap();
+        let signer_key = KeyPair::from_pkcs8_der_and_sign_algo(
+            &PrivatePkcs8KeyDer::from(signer_pkcs8.as_ref()),
+            &PKCS_ECDSA_P384_SHA384,
+        )
+        .unwrap();
+        let signer_params = CertificateParams::new(vec!["nitro-attester.invalid".into()]).unwrap();
+        let signer_certificate = signer_params.signed_by(&signer_key, &root).unwrap();
+        let pcrs = BTreeMap::from([(0, vec![0x11; 48]), (1, vec![0x22; 48])]);
+        let policy = NitroPolicy {
+            pcrs: pcrs
+                .iter()
+                .map(|(&index, value)| (index, vec![value.clone()]))
+                .collect(),
+            max_age: Duration::from_secs(60),
+            module_id: Some("test-nitro-module".into()),
+        };
+        (
+            TestAttester {
+                signer: Mutex::new(signer),
+                certificate: signer_certificate.der().to_vec(),
+                cabundle: vec![root.der().to_vec()],
+                pcrs,
+            },
+            policy,
+            Sha256::digest(root.der().as_ref()).into(),
+        )
     }
 
     fn now_millis(now: SystemTime) -> u64 {
@@ -652,5 +745,53 @@ mod tests {
             UnixTime::since_unix_epoch(now.duration_since(SystemTime::UNIX_EPOCH).unwrap()),
         );
         assert!(error.unwrap_err().to_string().contains("is stale"));
+    }
+
+    #[tokio::test]
+    async fn establishes_an_encrypted_tls_stream_after_attestation() {
+        let (attester, policy, root_fingerprint) = test_attester();
+        let context = b"example-attested-transport/1".to_vec();
+        let nonce = vec![9_u8; 32];
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let server_config = server_config_for_nonce(
+            &attester,
+            &context,
+            &nonce,
+            "tempo-zone-prover.invalid",
+            provider.clone(),
+        )
+        .unwrap();
+        let verifier = NitroServerVerifier {
+            policy,
+            context,
+            nonce,
+            provider: provider.clone(),
+            trust_anchor_fingerprint: root_fingerprint,
+        };
+        let client_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_no_client_auth();
+        let (client_io, server_io) = tokio::io::duplex(32 * 1024);
+        let server = tokio::spawn(async move {
+            TlsAcceptor::from(Arc::new(server_config))
+                .accept(server_io)
+                .await
+                .unwrap()
+        });
+        let mut client = TlsConnector::from(Arc::new(client_config))
+            .connect(
+                ServerName::try_from("tempo-zone-prover.invalid").unwrap().to_owned(),
+                client_io,
+            )
+            .await
+            .unwrap();
+        let mut server = server.await.unwrap();
+        client.write_all(b"prover-frame").await.unwrap();
+        let mut frame = [0_u8; 12];
+        server.read_exact(&mut frame).await.unwrap();
+        assert_eq!(&frame, b"prover-frame");
     }
 }
