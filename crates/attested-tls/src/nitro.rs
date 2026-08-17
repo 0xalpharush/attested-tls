@@ -521,7 +521,7 @@ mod tests {
 
         let tls_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let tls_spki = tls_key.subject_public_key_info();
-        let context = b"tempo-zone-prover/ratls/1".to_vec();
+        let context = b"example-attested-transport/1".to_vec();
         let nonce = vec![7_u8; 32];
         let pcrs = BTreeMap::from([(0, vec![0x11; 48]), (1, vec![0x22; 48])]);
         let bound_spki = document_spki.unwrap_or_else(|| tls_spki.clone());
