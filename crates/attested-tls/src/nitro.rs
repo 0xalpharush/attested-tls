@@ -429,4 +429,6 @@ pub enum NitroError {
     InvalidCertificateChain,
     #[error("could not generate the Nitro-attested TLS certificate")]
     CertificateGeneration,
+    #[error("Nitro attestation generation failed: {0}")]
+    AttestationGeneration(String),
 }
