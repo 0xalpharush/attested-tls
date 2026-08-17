@@ -26,6 +26,7 @@ ring = "0.17.14"
 attestation = { workspace = true, features = ["mock"] }
 mock-tdx = { workspace = true }
 rustls = { workspace = true, default-features = false, features = ["aws_lc_rs"] }
+tokio-rustls = { workspace = true }
 
 nested-tls = { path = "../nested-tls" }
 
